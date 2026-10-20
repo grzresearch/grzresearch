@@ -1,0 +1,41 @@
+name: liquidity field
+
+# Re-renders the live order book and force-pushes it to the `output` branch,
+# so main keeps a clean history while the profile always shows a fresh book.
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"          # every 20 min; GitHub may delay scheduled runs
+  push:
+    branches: [main]
+    paths: ["scripts/**", ".github/workflows/liquidity-field.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: liquidity-field
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Render the live order book
+        run: python3 scripts/liquidity_field.py --out dist/liquidity-field.svg
+
+      - name: Publish to the output branch
+        working-directory: dist
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          git init --quiet --initial-branch=output
+          git add liquidity-field.svg
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "liquidity field · $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force --quiet "https://x-access-token:${TOKEN}@github.com/${REPO}.git" output

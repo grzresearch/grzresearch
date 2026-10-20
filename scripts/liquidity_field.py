@@ -48,6 +48,8 @@ HMAX = 200                      # tallest pile
 BW = 3                          # bucket width in px
 PARTICLES = 5200                # particles under the depth curves at "now"
 EDGE = 110                      # width of the fade where the book leaves the card
+LABEL_Y = 262                   # wall callouts sit in a fixed row above the field
+TAG_Y = 298                     # and the mid's quote in the row below them
 
 # ── motion ──────────────────────────────────────────────────────────────────
 HISTORY = 60                    # minutes replayed
@@ -483,7 +485,7 @@ class Renderer:
         return out
 
     def lift(self, side: str) -> str:
-        """Only the vertical part of a side's frame, for what floats above the clip (labels)."""
+        """Only the vertical part of a side's frame, for what sits outside the side clip."""
         return self.along(f"lift-{side}", lambda x, lb, la: f"transform:translateY({f(lb if side == 'bid' else la)}px)")
 
     # ── assembly ────────────────────────────────────────────────────────────
@@ -604,9 +606,8 @@ class Renderer:
         return self.sided(self.stack("bid", piles["bid"], cut), self.stack("ask", piles["ask"], cut))
 
     def overlays(self) -> str:
-        """The mid and the wall labels ride above the edge fades."""
-        labels = "".join(f'<g class="{self.lift(side)}">{label}</g>' for side, label in self.wall_labels.items())
-        return self.mid() + labels
+        """Wall callouts and the mid ride above the edge fades; the mid's quote on top."""
+        return "".join(self.wall_labels.values()) + self.mid()
 
     def sided(self, bid: str, ask: str) -> str:
         """Split at the moving mid: the clip travels with the mid, and each side's frame
@@ -684,43 +685,60 @@ class Renderer:
                 f'<path d="M{f(wall.x0)} {f(c0)}L{f(wall.x0 + BW)} {f(c1)}" stroke="{near}" stroke-width="2.2"/>')
 
     def wall_label(self, side: str, wall: Bucket) -> str:
-        """Price and size, plus the wall's distance from the replayed mid, ticking each minute."""
+        """A callout pinned above the field: the wall's price, its distance from the replayed mid
+        and Σ, the BTC resting from the mid out to and including the wall (the pile's height
+        there). Both tick each minute; only the leader stretches to follow the cliff."""
+        s = self.s
         near, base, _ = BID if side == "bid" else ASK
-        x = wall.xc
-        top = min(self.curve(side, wall.x0), self.curve(side, wall.x0 + BW))
-        title, ts, tls = f"{side.upper()} WALL", 12, 1.5
-        dists = [signed((wall.top[0] / p - 1) * 100, "+.2f") + "%" for p in self.s.prices]
-        value_plain = f"{money(wall.top[0])} · {wall.volume:,.1f} BTC"
-        width = max(mono_width(title + "  " + max(dists, key=len), ts, tls), mono_width(value_plain, 15))
+        x, outer = wall.xc, (wall.x0 if side == "bid" else wall.x0 + BW)
+        top = min(self.curve(side, wall.x0), self.curve(side, wall.x0 + BW))   # cliff top, in the side's frame
+        title, ts, tls, vs = f"{side.upper()} WALL", 12, 1.5, 15
+        dists = [signed((wall.top[0] / p - 1) * 100, "+.2f") + "%" for p in s.prices]
+        sums = [f"Σ {abs(s.cumulative(t) - s.cumulative(outer)):,.1f} BTC" for t in s.track]
+        price = f"{money(wall.top[0])} · "
+        width = max(mono_width(f"{title}  {max(dists, key=len)}", ts, tls), mono_width(price + max(sums, key=len), vs))
         outward = -1 if side == "bid" else 1
         if (outward < 0 and x - 14 - width < PAD) or (outward > 0 and x + 14 + width > W - PAD):
             outward = -outward                                      # keep the label on the canvas
         left = x + 14 if outward > 0 else x - 14 - width
-        ty = top - 22
-        dx = left + mono_width(title + "  ", ts, tls)
-        lines = [text(dx, ty - 14 + i * 18, d, ts, MUTED, weight=700, ls=tls) for i, d in enumerate(dists)]
-        box = (left - 6, ty - 30, left + width + 6, ty + 9)
-        return (f'<rect x="{f(box[0])}" y="{f(box[1])}" width="{f(box[2] - box[0])}" height="{f(box[3] - box[1])}" '
+        y1, y2 = LABEL_Y, LABEL_Y + 18                              # title and value baselines
+        box = (left - 6, y1 - 16, left + width + 6, y2 + 9)
+        stub = (box[1] + box[3]) / 2
+        dx, vx = left + mono_width(title + "  ", ts, tls), left + mono_width(price, vs)
+        self.clips += 1
+        lead = f"lead{self.clips}"
+        return (f'<clipPath id="{lead}"><rect x="{f(x - 4)}" y="{f(stub)}" width="8" height="{f(BASE - stub)}"/></clipPath>'
+                f'<g clip-path="url(#{lead})"><g class="{self.lift(side)}">'
+                f'<path d="M{f(x)} {f(top)}V{f(top - 2 * H)}" stroke="{base}" stroke-opacity=".7"/>'
+                f'<circle cx="{f(x)}" cy="{f(top)}" r="2.6" fill="{near}"/></g></g>'
+                f'<rect x="{f(box[0])}" y="{f(box[1])}" width="{f(box[2] - box[0])}" height="{f(box[3] - box[1])}" '
                 f'rx="5" fill="{BG0}" opacity=".72"/>'
-                f'<path d="M{f(x)} {f(top - 4)}V{f(ty - 4)}h{f(outward * 8)}" fill="none" stroke="{base}" stroke-opacity=".7"/>'
-                f'<circle cx="{f(x)}" cy="{f(top)}" r="2.6" fill="{near}"/>'
-                + text(left, ty - 14, title, ts, base, weight=700, ls=tls)
-                + self.ticker(lines, (dx - 2, ty - 27, mono_width(max(dists, key=len), ts, tls) + 6, 17), 18)
-                + text(left, ty + 4, f'{money(wall.top[0])} <tspan fill="{MUTED}">· {wall.volume:,.1f} BTC</tspan>', 15, INK))
+                f'<path d="M{f(x)} {f(stub)}H{f(box[0] if outward > 0 else box[2])}" stroke="{base}" stroke-opacity=".7"/>'
+                + text(left, y1, title, ts, base, weight=700, ls=tls)
+                + self.ticker([text(dx, y1 + i * 18, d, ts, MUTED, weight=700, ls=tls) for i, d in enumerate(dists)],
+                              (dx - 2, y1 - 13, mono_width(max(dists, key=len), ts, tls) + 6, 17), 18)
+                + text(left, y2, money(wall.top[0]), vs, INK) + text(left + mono_width(money(wall.top[0]) + " ", vs), y2, "·", vs, MUTED)
+                + self.ticker([text(vx, y2 + i * 22, v, vs, MUTED) for i, v in enumerate(sums)],
+                              (vx - 2, y2 - 15, mono_width(max(sums, key=len), vs) + 6, 20), 22))
 
     def mid(self) -> str:
-        """The mid price: a BTC-orange beam that walks the hour across the fixed axis."""
-        top = BASE - HMAX - 12
+        """The mid price: a BTC-orange beam that walks the hour across the fixed axis,
+        carrying the price it stands at."""
+        prices = self.s.prices
+        tag_w = mono_width(max((money(p) for p in prices), key=len), 13) + 22
+        top = TAG_Y + 22
         arrive = self.animation("arrive", [(0, "opacity:.55"), (self.stops[-2], "opacity:.55"),
                                            (self.stops[-1], "opacity:1"), (HOLD_END, "opacity:.8"), (100, "opacity:.55")],
                                 "opacity:.8")
+        quotes = [text(0, TAG_Y + 16 + i * 20, money(p), 13, INK, "middle") for i, p in enumerate(prices)]
         return f'<g class="{self.walk()}">' + (
             f'<ellipse class="{arrive}" cy="{f((top + BASE) / 2)}" rx="30" ry="{f((BASE - top) / 2 + 30)}" fill="url(#beam-glow)"/>'
             f'<ellipse cy="{BASE - 6}" rx="80" ry="28" fill="url(#heat)" style="animation:pulse 2.2s ease-in-out infinite"/>'
             f'<rect x="-.8" y="{top}" width="1.6" height="{BASE - top}" fill="url(#beam)"/>'
-            f'<circle cy="{top}" r="2.4" fill="{BTC}"/>'
-            f'<path d="M0 {BASE - 5}l5 5-5 5-5-5z" fill="{BTC}"/>'
-            + "</g>")
+            f'<rect x="{f(-tag_w / 2)}" y="{TAG_Y}" width="{f(tag_w)}" height="22" rx="11" fill="#0B111C" '
+            f'stroke="{BTC}" stroke-opacity=".6"/>'
+            + self.ticker(quotes, (-tag_w / 2, TAG_Y, tag_w, 22), 20)
+            + f'<path d="M0 {BASE - 5}l5 5-5 5-5-5z" fill="{BTC}"/></g>')
 
     # ── axis ────────────────────────────────────────────────────────────────
     def ticks(self) -> list[tuple[float, float]]:

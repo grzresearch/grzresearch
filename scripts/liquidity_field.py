@@ -5,15 +5,19 @@ Pulls the level-2 order book, the last hour of 1-minute candles and the 24h
 stats from Coinbase Exchange (Kraken as fallback) and writes one
 self-contained, animated SVG:
 
-  * the price axis is fixed; every particle is resting liquidity at its level
+  * the price axis is fixed; each side of the book is a pile of particles
+    stacked level by level up to its cumulative depth curve, never above it
   * the mid replays the last 60 minutes of BTC across that axis: below it the
     book is bid, above it ask, so a rising mid eats into the sell side and a
-    falling mid into the buy side
+    falling mid into the buy side, and both piles re-stack from the new mid
   * the headline price, the wall distances, imbalance and depth all tick with
-    the replayed mid; the tallest untouched columns are the bid and ask walls
+    the replayed mid; the largest untouched levels are the bid and ask walls,
+    standing as cliffs in the depth curve
 
-Every replay-synchronised motion runs on the SVG's own SMIL clock, so nothing
-drifts apart. Standard library only, so it runs on a bare GitHub Actions runner.
+Every replay-synchronised motion is a CSS animation on the same 32 s clock. Each
+animated element's resting style is the live state, so visitors who prefer
+reduced motion see the book as it is now. Standard library only, so it runs on
+a bare GitHub Actions runner.
 
     python3 scripts/liquidity_field.py --out dist/liquidity-field.svg
     python3 scripts/liquidity_field.py --demo --out preview.svg   # offline
@@ -30,7 +34,8 @@ import math
 import random
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from functools import cached_property
 from pathlib import Path
 
 # ── canvas ──────────────────────────────────────────────────────────────────
@@ -39,18 +44,17 @@ PAD = 40
 CX = W / 2                      # centre of the price axis
 HALF_W = CX - PAD               # px from the centre to the edge of the plotted book
 BASE = 506                      # baseline of the liquidity field
-HMAX = 200                      # tallest column
+HMAX = 200                      # tallest pile
 BW = 3                          # bucket width in px
-PARTICLES = 5200                # resting-liquidity particles (walls add more)
-RAIN = 80                       # incoming limit orders
-SPARKS = 36                     # executions at the touch
+PARTICLES = 5200                # particles under the depth curves at "now"
 EDGE = 110                      # width of the fade where the book leaves the card
 
 # ── motion ──────────────────────────────────────────────────────────────────
 HISTORY = 60                    # minutes replayed
-LOOP = 32.0                     # seconds per replay loop
+LOOP = 32                       # seconds per replay loop
 REPLAY_END = 84.0               # % of the loop spent replaying the hour
 HOLD_END = 93.0                 # % at which the rewind starts
+REWIND = (0.7, 0.0, 0.3, 1.0)   # cubic-bezier of the rewind
 TWINKLE = (1.0, 0.9, 0.78, 0.66, 0.42, 0.35)   # particle alphas; each shimmers around its own level
 
 # ── palette ─────────────────────────────────────────────────────────────────
@@ -74,7 +78,7 @@ class Market:
     source: str
     bids: list[tuple[float, float]]      # (price, size), best first
     asks: list[tuple[float, float]]
-    closes: list[float]                  # 1m closes, oldest first
+    closes: list[float]                  # close of each of the last HISTORY whole minutes, oldest first
     open_24h: float
     high_24h: float
     low_24h: float
@@ -88,22 +92,49 @@ def _get(url: str):
         return json.load(r)
 
 
+def minute_grid(candles: list[tuple[int, float]], now: datetime) -> list[float]:
+    """Closes of the last HISTORY completed minutes, oldest first.
+
+    Venues skip minutes without trades and include the minute still in progress;
+    keying on the candle start times fixes both, so '−5m' really is five minutes ago.
+    """
+    closes = dict(candles)
+    current = int(now.timestamp()) // 60 * 60
+    grid, last = [], None
+    for start in range(current - 60 * HISTORY, current, 60):
+        last = closes.get(start, last)
+        grid.append(last)
+    first = next((c for c in grid if c is not None), None)
+    if first is None:
+        raise ValueError("no candles in the last hour")
+    return [first if c is None else c for c in grid]
+
+
+def _checked(m: Market) -> Market:
+    if not m.bids or not m.asks:
+        raise ValueError("order book has an empty side")
+    return m
+
+
 def coinbase() -> Market:
     base = "https://api.exchange.coinbase.com/products/BTC-USD"
+    now = datetime.now(timezone.utc)
+    stamp = "%Y-%m-%dT%H:%M:%SZ"
+    span = f"start={(now - timedelta(minutes=HISTORY + 5)).strftime(stamp)}&end={now.strftime(stamp)}"
     book = _get(f"{base}/book?level=2")
-    candles = sorted(_get(f"{base}/candles?granularity=60"))      # [t, lo, hi, open, close, vol]
+    candles = _get(f"{base}/candles?granularity=60&{span}")      # explicit span skips a 5-min CDN cache
     stats = _get(f"{base}/stats")
-    return Market(
+    return _checked(Market(
         source="COINBASE",
         bids=[(float(p), float(s)) for p, s, *_ in book["bids"]],
         asks=[(float(p), float(s)) for p, s, *_ in book["asks"]],
-        closes=[float(c[4]) for c in candles[-HISTORY:]],
+        closes=minute_grid([(int(c[0]), float(c[4])) for c in candles], now),   # [t, lo, hi, open, close, vol]
         open_24h=float(stats["open"]),
         high_24h=float(stats["high"]),
         low_24h=float(stats["low"]),
         volume_24h=float(stats["volume"]),
-        time=datetime.now(timezone.utc),
-    )
+        time=now,
+    ))
 
 
 def kraken() -> Market:
@@ -113,20 +144,21 @@ def kraken() -> Market:
             raise RuntimeError(body["error"])
         return next(v for k, v in body["result"].items() if k != "last")
 
+    now = datetime.now(timezone.utc)
     book = result("Depth?pair=XBTUSD&count=500")
     candles = result("OHLC?pair=XBTUSD&interval=1")                # [t, o, h, l, close, vwap, vol, n]
     tick = result("Ticker?pair=XBTUSD")
-    return Market(
+    return _checked(Market(
         source="KRAKEN",
         bids=[(float(p), float(s)) for p, s, _ in book["bids"]],
         asks=[(float(p), float(s)) for p, s, _ in book["asks"]],
-        closes=[float(c[4]) for c in candles[-HISTORY:]],
+        closes=minute_grid([(int(c[0]), float(c[4])) for c in candles], now),
         open_24h=float(tick["o"]),
         high_24h=float(tick["h"][1]),
         low_24h=float(tick["l"][1]),
         volume_24h=float(tick["v"][1]),
-        time=datetime.now(timezone.utc),
-    )
+        time=now,
+    ))
 
 
 def demo() -> Market:
@@ -171,7 +203,6 @@ class Bucket:
     kind: str = ""                       # "bid" / "ask": never crossed by the mid; "zone": crossed
     volume: float = 0.0
     top: tuple[float, float] = (0.0, 0.0)   # largest single level (price, size)
-    h: float = 0.0                       # column height in px
 
     @property
     def xc(self) -> float:
@@ -198,12 +229,13 @@ class Scene:
         lo, hi = min(self.prices), max(self.prices)
         self.center = math.sqrt(lo * hi)                            # axis centred on the hour's range
         half = math.log(hi / lo) / 2
-        self.R = min(0.03, max(0.008, math.ceil(2.6 * half / 0.0025) * 0.0025))
+        self.R = min(0.25, max(0.008, math.ceil(2.6 * half / 0.0025) * 0.0025,
+                               half * HALF_W / (HALF_W - EDGE - 20)))   # the mid never enters the fades
         self.px = HALF_W / self.R                                   # px per unit of log-price
         self.track = [self.x(p) for p in self.prices]               # where the mid stands, minute by minute
 
-        rets = [math.log(b / a) for a, b in itertools.pairwise(self.prices)]
-        mean = sum(rets) / len(rets)
+        rets = [math.log(b / a) for a, b in zip(self.prices, self.prices[1:])]
+        mean = sum(rets) / max(1, len(rets))
         self.sigma = math.sqrt(sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1) * 525_600)
 
         self.buckets = self._bucketise()
@@ -211,19 +243,18 @@ class Scene:
         for b in self.buckets:
             b.kind = "bid" if b.x0 + BW <= zone_lo else "ask" if b.x0 >= zone_hi else "zone"
         plotted = [b for b in self.buckets if PAD <= b.xc <= W - PAD]
-        vref = max(b.volume for b in plotted) or 1.0
-        for b in self.buckets:
-            b.h = HMAX * min(1.0, shape(b.volume / vref))
         self.edges = list(itertools.accumulate((b.volume for b in self.buckets), initial=0.0))
 
-        # walls: the largest columns the replayed mid never touches, so they keep their side
+        # walls: the largest levels the replayed mid never touches, so they keep their side
         self.walls = {}
         for side in ("bid", "ask"):
             pool = [b for b in plotted if b.kind == side and b.volume > 0 and PAD + 60 <= b.xc <= W - PAD - 60]
             if pool:
                 self.walls[side] = max(pool, key=lambda b: b.volume)
 
-        # depth either side of the moving mid, within ±R
+        # depth either side of the moving mid, within a band the venue's book actually covers
+        covered = min(math.log(self.mid / m.bids[-1][0]), math.log(m.asks[-1][0] / self.mid))
+        self.band = max(min(self.R, covered), 1e-4)
         levels = sorted(m.bids + m.asks)
         self._prices = [p for p, _ in levels]
         self._cum = list(itertools.accumulate((s for _, s in levels), initial=0.0))
@@ -239,10 +270,11 @@ class Scene:
         return self.edges[i] + (j - i) * self.buckets[i].volume
 
     def depth_at(self, mid: float) -> tuple[float, float]:
-        def total(lo: float, hi: float) -> float:
-            return self._cum[bisect.bisect_left(self._prices, hi)] - self._cum[bisect.bisect_right(self._prices, lo)]
-        lo, hi = mid * math.exp(-self.R), mid * math.exp(self.R)
-        return total(lo, mid), total(mid, hi)
+        """Size resting in (mid·e^−band, mid] and (mid, mid·e^band): a level at the mid counts once, as bid."""
+        def upto(price: float) -> float:
+            return self._cum[bisect.bisect_right(self._prices, price)]
+        lo, hi = mid * math.exp(-self.band), mid * math.exp(self.band)
+        return upto(mid) - upto(lo), upto(hi) - upto(mid)
 
     def _bucketise(self) -> list[Bucket]:
         out = [Bucket(j * BW) for j in range(math.ceil(W / BW))]
@@ -260,11 +292,6 @@ class Scene:
         return out
 
 
-def shape(u: float) -> float:
-    """Log-like height curve: walls stand tall without flattening the rest."""
-    return math.log1p(90 * u) / math.log1p(90)
-
-
 # ═══ svg primitives ═════════════════════════════════════════════════════════
 
 def f(v: float) -> str:
@@ -273,9 +300,9 @@ def f(v: float) -> str:
     return s.replace("0.", ".", 1) if s.startswith(("0.", "-0.")) else (s if s != "-0" else "0")
 
 
-def t(v: float) -> str:
-    """A SMIL keyTime."""
-    return f"{v:.5f}".rstrip("0").rstrip(".") or "0"
+def pct(p: float) -> str:
+    """A keyframe selector."""
+    return (f"{p:.4f}".rstrip("0").rstrip(".") or "0") + "%"
 
 
 def text(x, y, s, size, fill=INK, anchor="start", weight=400, ls=0.0, family=MONO, extra="") -> str:
@@ -325,24 +352,43 @@ def twinkle(alpha: float, dur: float, delay: float = 0.0) -> str:
     return f"animation:{twinkle_name(alpha)} {dur:.2f}s ease-in-out -{delay:.2f}s infinite"
 
 
+def ease(u: float, curve: tuple[float, float, float, float] = REWIND) -> float:
+    """CSS cubic-bezier(x1, y1, x2, y2) at time fraction u."""
+    x1, y1, x2, y2 = curve
+
+    def bez(s: float, a: float, b: float) -> float:
+        return 3 * a * s * (1 - s) ** 2 + 3 * b * s * s * (1 - s) + s ** 3
+    lo, hi = 0.0, 1.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if bez(mid, x1, x2) < u else (lo, mid)
+    return bez((lo + hi) / 2, y1, y2)
+
+
+def simplify(points: list[tuple[float, tuple[float, ...]]], tol: float) -> list[tuple[float, tuple[float, ...]]]:
+    """Drop keyframes that linear interpolation already reproduces within `tol` in every
+    series (Douglas–Peucker), so animations sharing the result stay locked together."""
+    keep, todo = {0, len(points) - 1}, [(0, len(points) - 1)]
+    while todo:
+        a, b = todo.pop()
+        (ta, va), (tb, vb) = points[a], points[b]
+        worst, at = tol, None
+        for i in range(a + 1, b):
+            ti, vi = points[i]
+            w = (ti - ta) / (tb - ta)
+            err = max(abs(v - (lo + (hi - lo) * w)) for v, lo, hi in zip(vi, va, vb))
+            if err > worst:
+                worst, at = err, i
+        if at is not None:
+            keep.add(at)
+            todo += [(a, at), (at, b)]
+    return [points[i] for i in sorted(keep)]
+
+
 def font_face(family: str, file: str, weight: int) -> str:
     data = base64.b64encode((FONTS / file).read_bytes()).decode()
     return (f"@font-face{{font-family:{family};font-weight:{weight};"
             f"src:url(data:font/woff2;base64,{data}) format('woff2')}}")
-
-
-def smooth(values: list[float], radius: int) -> list[float]:
-    kernel = [math.exp(-0.5 * (i / (radius / 2)) ** 2) for i in range(-radius, radius + 1)]
-    out = []
-    for i in range(len(values)):
-        acc = wsum = 0.0
-        for j, w in enumerate(kernel):
-            k = i + j - radius
-            if 0 <= k < len(values):
-                acc += values[k] * w
-                wsum += w
-        out.append(acc / wsum)
-    return out
 
 
 # ═══ scene → svg ════════════════════════════════════════════════════════════
@@ -352,76 +398,127 @@ class Renderer:
         self.s = scene
         self.rng = random.Random(seed)
         n = len(scene.prices)
-        self.kt = [REPLAY_END / 100 * i / (n - 1) for i in range(n)]   # keyTime of each minute
+        self.stops = [REPLAY_END * i / (n - 1) for i in range(n)]   # keyframe % of each minute
+        self.css: dict[str, str] = {}                              # replay keyframes, registered while drawing
         self.clips = 0
-        self.labels: list[tuple[float, float, float, float]] = []      # boxes the rain must not cross
+        self.wall_labels: dict[str, str] = {}
+        F = scene.cumulative
+        self.zone = (min(scene.track), max(scene.track))             # the stretch the mid crosses
+        lo, hi = self.zone
+        self.scale = 0.92 * HMAX / max(F(hi) - F(PAD), F(W - PAD) - F(lo), 1e-9)   # px per BTC of depth
+        now = scene.track[-1]
+        area = self.scale * BW * sum(abs(F(b.xc) - F(now)) for b in scene.buckets if PAD <= b.xc <= W - PAD)
+        self.density = PARTICLES / max(area, 1.0)                    # particles per px² under the curves
 
     # ── the replay clock ────────────────────────────────────────────────────
-    def replay(self, attr: str, values: list[str], translate: bool = False) -> str:
-        """Glide through one value per minute, hold on NOW, then ease back for the rewind."""
-        kt = self.kt + [HOLD_END / 100, 1.0]
-        vals = values + [values[-1], values[0]]
-        splines = ["0 0 1 1"] * (len(kt) - 2) + [".7 0 .3 1"]
-        return self._smil(attr, vals, kt, "spline", translate, splines)
+    # Every replay-synced motion is a CSS animation of LOOP seconds: the hour plays over
+    # 0–REPLAY_END %, holds on NOW until HOLD_END %, then eases back for the rewind. A
+    # class's resting style is the live state, which reduced-motion visitors see.
+    def animation(self, name: str, frames: list[tuple[float, str]], rest: str, timing: str = "linear") -> str:
+        """Register keyframes plus a class that runs them; `rest` is the live state."""
+        if name not in self.css:
+            body = " ".join(f"{pct(p)}{{{decl}}}" for p, decl in frames)
+            self.css[name] = f"@keyframes {name}{{{body}}}.{name}{{{rest};animation:{name} {LOOP}s {timing} infinite}}"
+        return name
 
-    def steps(self, attr: str, values: list[str], translate: bool = False, rewind: str | None = None) -> str:
-        """Jump to one value per minute (and optionally a rewind value) without interpolating."""
-        kt = self.kt + ([HOLD_END / 100] if rewind is not None else [])
-        vals = values + ([rewind] if rewind is not None else [])
-        return self._smil(attr, vals, kt, "discrete", translate)
+    def glide(self, name: str, decls: list[str], timing: str = "linear") -> str:
+        """One declaration per minute, hold on the last, ease back to the first for the rewind."""
+        rewind = f";animation-timing-function:cubic-bezier({','.join(f'{v:g}' for v in REWIND)})"
+        frames = list(zip(self.stops, decls)) + [(HOLD_END, decls[-1] + rewind), (100, decls[0])]
+        return self.animation(name, frames, decls[-1], timing)
 
-    @staticmethod
-    def _smil(attr, values, key_times, mode, translate, splines=None) -> str:
-        tag = "animateTransform" if translate else "animate"
-        extra = ' type="translate"' if translate else ""
-        if splines:
-            extra += f' keySplines="{";".join(splines)}"'
-        return (f'<{tag} attributeName="{attr}"{extra} dur="{LOOP}s" repeatCount="indefinite" calcMode="{mode}" '
-                f'keyTimes="{";".join(t(k) for k in key_times)}" values="{";".join(values)}"/>')
+    @cached_property
+    def journey(self) -> list[tuple[float, float, float, float]]:
+        """(keyframe %, mid x, bid lift, ask lift): the keyframes every motion locked to the mid shares."""
+        pts = [(p, (x, BASE - self.curve("bid", x), BASE - self.curve("ask", x))) for p, x in self.path_samples()]
+        return [(p, *v) for p, v in simplify(pts, 0.3)]
 
-    def ticker(self, lines: list[str], window: tuple[float, float, float, float], lh: float,
-               rewind_line: str | None = None, attrs: str = "") -> str:
+    def along(self, name: str, decl) -> str:
+        """An animation keyed on the journey; decl maps (x, bid lift, ask lift) to a declaration."""
+        x = self.s.track[-1]
+        now = (x, BASE - self.curve("bid", x), BASE - self.curve("ask", x))
+        return self.animation(name, [(p, decl(*v)) for p, *v in self.journey], decl(*now))
+
+    def walk(self) -> str:
+        """The mid's horizontal journey across the fixed axis."""
+        return self.along("mo", lambda x, lb, la: f"transform:translateX({f(x)}px)")
+
+    def frame(self, side: str) -> str:
+        """A side's frame: it counter-travels the clip (so the book stays put) and lifts so
+        the depth curve meets the baseline exactly at the moving mid."""
+        return self.along(f"frame-{side}", lambda x, lb, la: f"transform:translate({f(-x)}px,{f(lb if side == 'bid' else la)}px)")
+
+    def stepper(self, lh: float) -> str:
+        """Jump one line of height lh per minute; spin back through the hour on rewind."""
+        n = len(self.s.prices)
+        return self.glide(f"tick{f(lh)}", [f"transform:translateY({f(-i * lh)}px)" for i in range(n)], "step-end")
+
+    def ticker(self, lines: list[str], window: tuple[float, float, float, float], lh: float) -> str:
         """Stacked text lines behind a fixed window, stepping one line per minute."""
         x, y, w, h = window
         self.clips += 1
         cid = f"tk{self.clips}"
-        rows = lines + ([rewind_line] if rewind_line is not None else [])
-        values = [f"0 {f(-i * lh)}" for i in range(len(lines))]
-        rewind = f"0 {f(-len(lines) * lh)}" if rewind_line is not None else None
         return (f'<clipPath id="{cid}"><rect x="{f(x)}" y="{f(y)}" width="{f(w)}" height="{f(h)}"/></clipPath>'
-                f'<g clip-path="url(#{cid})"><g{attrs}>{"".join(rows)}'
-                f'{self.steps("transform", values, translate=True, rewind=rewind)}</g></g>')
+                f'<g clip-path="url(#{cid})"><g class="{self.stepper(lh)}">{"".join(lines)}</g></g>')
+
+    def path_samples(self) -> list[tuple[float, float]]:
+        """(keyframe %, mid x) at every bucket edge the mid crosses, plus the eased rewind.
+
+        Between these samples the mid moves linearly and the depth F is linear too, so
+        a lift keyed on them keeps each depth curve touching the baseline at the mid.
+        """
+        track, stops = self.s.track, self.stops
+        out = []
+        for x0, x1, p0, p1 in zip(track, track[1:], stops, stops[1:]):
+            out.append((p0, x0))
+            if x1 != x0:
+                edges = range(math.floor(min(x0, x1) / BW) + 1, math.ceil(max(x0, x1) / BW))
+                for e in sorted((k * BW for k in edges), reverse=x1 < x0):
+                    out.append((p0 + (e - x0) / (x1 - x0) * (p1 - p0), e))
+        out += [(stops[-1], track[-1]), (HOLD_END, track[-1])]
+        steps = 90
+        for k in range(1, steps + 1):
+            u = k / steps
+            out.append((HOLD_END + u * (100 - HOLD_END), track[-1] + ease(u) * (track[0] - track[-1])))
+        return out
+
+    def lift(self, side: str) -> str:
+        """Only the vertical part of a side's frame, for what floats above the clip (labels)."""
+        return self.along(f"lift-{side}", lambda x, lb, la: f"transform:translateY({f(lb if side == 'bid' else la)}px)")
 
     # ── assembly ────────────────────────────────────────────────────────────
     def svg(self) -> str:
         s = self.s
         walls = " and ".join(f"{side} wall {money(w.top[0])}" for side, w in s.walls.items()) or "no walls"
-        return "\n".join([
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
-            f'font-family="{MONO}" role="img" aria-labelledby="t d">',
-            '<title id="t">GRZ_Research · live BTC-USD limit order book</title>',
-            f'<desc id="d">Live {s.m.source} level-2 order book for BTC-USD rendered as a particle field on a '
-            f'fixed price axis; mid {money(s.mid)} USD, {walls}. The mid replays the last {HISTORY} minutes: '
-            f'liquidity below it is bid, above it ask.</desc>',
-            self.defs(),
+        body = [
             self.backdrop(),
             '<g clip-path="url(#field)">',
             self.dust(),
             self.grid(),
             self.book(),
             self.edge_fades(),
+            self.overlays(),
             "</g>",
             self.axis(),
             self.header(),
             self.headline(),
             self.stats(),
             f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="18" fill="none" stroke="#1B2333"/>',
+        ]
+        return "\n".join([
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" '
+            f'font-family="{MONO}" role="img" aria-labelledby="t d">',
+            '<title id="t">GRZ_Research · live BTC-USD limit order book</title>',
+            f'<desc id="d">Live {s.m.source} level-2 order book for BTC-USD as two piles of particles under the '
+            f'cumulative depth curves, on a fixed price axis; mid {money(s.mid)} USD, {walls}. The mid replays the '
+            f'last {HISTORY} minutes: liquidity below it is bid, above it ask.</desc>',
+            self.defs(),
+            *body,
             "</svg>",
         ])
 
-    # ── defs: fonts, keyframes, gradients, the moving bid/ask boundary ──────
+    # ── defs: fonts, keyframes, gradients ───────────────────────────────────
     def defs(self) -> str:
-        track = [f(x) for x in self.s.track]
         # stroke-opacity, not opacity: animating opacity forces an offscreen layer per path per frame
         twinkles = "".join(f"@keyframes {twinkle_name(a)}{{0%,100%{{stroke-opacity:{a:g}}} 50%{{stroke-opacity:{a * .35:.3f}}}}}"
                            for a in TWINKLE)
@@ -430,26 +527,17 @@ class Renderer:
 {font_face("JBM", "jbm-700.woff2", 700)}
 {font_face("IDL", "inter-300.woff2", 300)}
 {twinkles}
-@keyframes fall{{0%{{transform:translateY(var(--d,-120px));opacity:0}} 18%{{opacity:1}} 90%{{opacity:.75}} 100%{{transform:translateY(0);opacity:0}}}}
+{"".join(self.css.values())}
 @keyframes rise{{from{{transform:translateY(0)}} to{{transform:translateY(-26px)}}}}
 @keyframes pulse{{0%,100%{{opacity:.25}} 50%{{opacity:1}}}}
 @keyframes blink{{0%,55%{{opacity:1}} 56%,100%{{opacity:0}}}}
-@keyframes spark{{0%{{opacity:0;transform:translate(0,0)}} 12%{{opacity:1}} 100%{{opacity:0;transform:translate(var(--sx),var(--sy))}}}}
-.fall{{animation:fall 2.4s cubic-bezier(.55,0,1,.45) infinite}}
-.spark{{animation:spark 1.8s cubic-bezier(.1,.6,.3,1) infinite}}
 @media (prefers-reduced-motion:reduce){{*{{animation:none!important}}}}
 """
         grads = []
         for name, (near, base, _) in (("bid", BID), ("ask", ASK)):
-            grads.append(f'<linearGradient id="haze-{name}" x1="0" y1="0" x2="0" y2="1">'
-                         f'<stop offset="0" stop-color="{base}" stop-opacity=".16"/>'
-                         f'<stop offset="1" stop-color="{base}" stop-opacity="0"/></linearGradient>')
-            grads.append(f'<linearGradient id="drop-{name}" x1="0" y1="0" x2="0" y2="1">'
-                         f'<stop offset="0" stop-color="{base}" stop-opacity="0"/>'
-                         f'<stop offset="1" stop-color="{near}"/></linearGradient>')
             grads.append(f'<linearGradient id="wall-{name}" x1="0" y1="0" x2="0" y2="1">'
                          f'<stop offset="0" stop-color="{near}" stop-opacity=".0"/>'
-                         f'<stop offset=".25" stop-color="{base}" stop-opacity=".22"/>'
+                         f'<stop offset=".08" stop-color="{base}" stop-opacity=".22"/>'
                          f'<stop offset="1" stop-color="{base}" stop-opacity=".05"/></linearGradient>')
             grads.append(f'<radialGradient id="glow-{name}"><stop offset="0" stop-color="{base}" stop-opacity=".11"/>'
                          f'<stop offset="1" stop-color="{base}" stop-opacity="0"/></radialGradient>')
@@ -467,9 +555,9 @@ class Renderer:
 {"".join(grads)}
 <pattern id="dotgrid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="12" cy="12" r=".7" fill="#1A2232"/></pattern>
 <clipPath id="field"><rect x="1" y="1" width="{W - 2}" height="{H - 2}" rx="17"/></clipPath>
-<clipPath id="plot"><rect y="{BASE - HMAX - 14}" width="{W}" height="{HMAX + 15}"/></clipPath>
-<clipPath id="below-mid"><rect width="{track[0]}" height="{H}">{self.replay("width", track)}</rect></clipPath>
-<clipPath id="above-mid"><rect x="{track[0]}" width="{W}" height="{H}">{self.replay("x", track)}</rect></clipPath>
+<clipPath id="plot"><rect x="{-2 * W}" y="{BASE - HMAX - 14}" width="{4 * W}" height="{HMAX + 15}"/></clipPath>
+<clipPath id="left-of"><rect x="{-2 * W}" width="{2 * W}" height="{H}"/></clipPath>
+<clipPath id="right-of"><rect width="{2 * W}" height="{H}"/></clipPath>
 </defs>"""
 
     # ── backdrop ────────────────────────────────────────────────────────────
@@ -488,7 +576,7 @@ class Renderer:
     def dust(self) -> str:
         out = []
         for i, (size, alpha, n) in enumerate(((0.9, 0.22, 140), (1.4, 0.14, 90), (2.2, 0.07, 40))):
-            pts = [(self.rng.uniform(0, W), self.rng.uniform(150, H - 60)) for _ in range(n)]
+            pts = [(self.rng.uniform(0, W), self.rng.uniform(16, BASE - HMAX - 50)) for _ in range(n // 2)]
             out.append(f'<path d="{dots(pts)}" stroke="#9DB2D3" stroke-opacity="{alpha}" stroke-width="{size}" '
                        f'stroke-linecap="round" style="animation:rise {22 + 7 * i}s ease-in-out -{4 * i}s infinite alternate"/>')
         return "".join(out)
@@ -502,103 +590,109 @@ class Renderer:
             out.append(f'<line x1="{f(x)}" x2="{f(x)}" y1="{BASE - HMAX}" y2="{BASE}" stroke="{LINE}" stroke-dasharray="2 6"/>')
         return "".join(out)
 
-    # ── the book: haze, depth, particles, walls, flow, mid ──────────────────
+    # ── the book: each side piled up to its cumulative depth curve ──────────
+    #
+    # Depth at pixel x is |F(x) − F(mid)|, F being the liquidity resting left of x.
+    # So each side is drawn once in its own frame, where its depth curve is the static
+    # ±F(x), and the frame only lifts as the mid moves: curve, particles and walls
+    # stay exact, and nothing ever pokes above the line.
     def book(self) -> str:
-        return "".join([self.haze(), self.depth_lines(), self.particles(), self.walls(), self.rain(), self.mid()])
+        self.wall_labels = {side: self.wall_label(side, wall) for side, wall in self.s.walls.items()}
+        piles = {side: self.pile(side) for side in ("bid", "ask")}
+        sizes = sorted(v for pile in piles.values() for *_, v in pile) or [0.0]
+        cut = (sizes[int(len(sizes) * 0.35)], sizes[int(len(sizes) * 0.75)])
+        return self.sided(self.stack("bid", piles["bid"], cut), self.stack("ask", piles["ask"], cut))
 
-    @staticmethod
-    def sided(bid: str, ask: str) -> str:
-        """Content split by the moving mid: `bid` shows below it, `ask` above it."""
-        return f'<g clip-path="url(#below-mid)">{bid}</g><g clip-path="url(#above-mid)">{ask}</g>'
+    def overlays(self) -> str:
+        """The mid and the wall labels ride above the edge fades."""
+        labels = "".join(f'<g class="{self.lift(side)}">{label}</g>' for side, label in self.wall_labels.items())
+        return self.mid() + labels
 
-    def haze(self) -> str:
-        bs = self.s.buckets
-        hs = smooth([b.h for b in bs], 5)
-        d = ("M0 " + str(BASE) + "L" + "L".join(f"{f(b.xc)} {f(BASE - h * 0.9)}" for b, h in zip(bs, hs))
-             + f"L{W} {BASE}Z")
-        return self.sided(f'<path d="{d}" fill="url(#haze-bid)"/>', f'<path d="{d}" fill="url(#haze-ask)"/>')
+    def sided(self, bid: str, ask: str) -> str:
+        """Split at the moving mid: the clip travels with the mid, and each side's frame
+        counter-travels inside it, so the book stays put and only the boundary moves."""
+        return "".join(f'<g class="{self.walk()}"><g clip-path="url(#{clip})">{content}</g></g>'
+                       for clip, content in (("left-of", bid), ("right-of", ask)))
 
-    def depth_lines(self) -> str:
-        """Cumulative depth out from the moving mid: the classic exchange depth chart.
+    def curve(self, side: str, x: float) -> float:
+        """The side's depth curve in its own frame."""
+        return (1 if side == "bid" else -1) * self.scale * self.s.cumulative(x)
 
-        Depth at x is |F(x) − F(mid)| with F the liquidity left of x, so each side is
-        one static curve that only slides vertically as the mid moves.
-        """
-        s = self.s
-        zone_lo, zone_hi = min(s.track), max(s.track)
-        scale = 0.92 * HMAX / max(s.cumulative(zone_hi) - s.cumulative(PAD),
-                                  s.cumulative(W - PAD) - s.cumulative(zone_lo), 1e-9)
-        lines = {}
-        for name, sign, (lo, hi) in (("bid", 1, (0, zone_hi)), ("ask", -1, (zone_lo, W))):
-            xs = [b.x0 for b in s.buckets if lo - BW <= b.x0 <= hi] + [min(hi, W)]
-            d = "M" + "L".join(f"{f(x)} {f(sign * scale * s.cumulative(x))}" for x in xs)
-            lift = [f"0 {f(BASE - sign * scale * s.cumulative(x))}" for x in s.track]
-            color = (BID if name == "bid" else ASK)[1]
-            lines[name] = (f'<g clip-path="url(#plot)"><g>'
-                           f'<path d="{d}" fill="none" stroke="{color}" stroke-opacity=".10" stroke-width="6" stroke-linejoin="round"/>'
-                           f'<path d="{d}" fill="none" stroke="{color}" stroke-opacity=".55" stroke-width="1.1" '
-                           f'stroke-linejoin="round" stroke-dasharray="3 3"/>'
-                           f'{self.replay("transform", lift, translate=True)}</g></g>')
-        return self.sided(lines["bid"], lines["ask"])
+    def reach(self, side: str) -> tuple[float, float, float, float]:
+        """x-range a side can occupy, and the band of its frame that is ever on screen."""
+        lo, hi = self.zone
+        ends = (self.curve(side, lo), self.curve(side, hi))
+        x_from, x_to = (0.0, hi) if side == "bid" else (lo, float(W))
+        return x_from, x_to, min(ends) - HMAX - 14, max(ends)
 
-    def particles(self) -> str:
-        rng, s = self.rng, self.s
-        density = PARTICLES / sum(b.h for b in s.buckets)
-        layers: dict[tuple, list] = {}
-        caps: dict[str, list] = {}
+    def pile(self, side: str) -> list[tuple[float, float, float]]:
+        """Particles filling the area under the depth curve, each tagged with the size of
+        the price level whose stratum it sits in (levels stack outward from the mid)."""
+        s, rng, sign = self.s, self.rng, (1 if side == "bid" else -1)
+        x_from, x_to, ceiling, floor = self.reach(side)
+        out = []
         for b in s.buckets:
-            if b.volume <= 0:
+            if not x_from - BW < b.x0 < x_to:
                 continue
-            for _ in range(max(1, round(b.h * density))):
-                u = rng.random()
-                x, y = b.x0 + rng.random() * BW, BASE - 1.2 - (b.h - 1.2) * u ** 0.9
-                tier = 0 if u > 0.8 else 2 if u < 0.3 and rng.random() < 0.5 else 1   # column tops glow
-                layers.setdefault((b.kind, tier, rng.random() < 0.16, rng.randrange(3)), []).append((x, y))
-            if b.h > 3:
-                caps.setdefault(b.kind, []).append((b.xc, BASE - b.h))
+            top = max(min(self.curve(side, b.x0), self.curve(side, b.x0 + BW)), ceiling)
+            if floor <= top:
+                continue
+            expected = self.density * BW * (floor - top)
+            for _ in range(int(expected) + (rng.random() < expected % 1)):
+                x, y = b.x0 + rng.random() * BW, top + rng.random() * (floor - top)
+                if y < self.curve(side, x) + 1.2:
+                    continue                                        # never above the line, not even by a radius
+                k = bisect.bisect_right(s.edges, sign * y / self.scale) - 1
+                out.append((x, y, s.buckets[min(max(k, 0), len(s.buckets) - 1)].volume))
+        return out
 
-        def paint(kind: str, side: str) -> str:
-            palette, out = BID if side == "bid" else ASK, []
-            for (k, tier, coarse, group), pts in sorted(layers.items()):
-                if k != kind:
-                    continue
-                width, alpha = (2.3, 0.42) if coarse else (1.25, TWINKLE[1 + tier])
-                dur = 2.6 + 1.1 * group + 0.4 * tier + (tier + group) % 3 * 0.37
-                out.append(f'<path d="{dots(pts)}" stroke="{palette[tier]}" stroke-opacity="{alpha:g}" '
-                           f'stroke-width="{width}" stroke-linecap="round" style="{twinkle(alpha, dur, dur * group / 3)}"/>')
-            if caps.get(kind):
-                out.append(f'<path d="{dots(caps[kind])}" stroke="{palette[0]}" stroke-width="1.7" '
-                           f'stroke-linecap="round" style="{twinkle(1.0, 3.3)}"/>')
-            return "".join(out)
+    def stack(self, side: str, pile: list[tuple[float, float, float]], cut: tuple[float, float]) -> str:
+        rng, s = self.rng, self.s
+        palette = BID if side == "bid" else ASK
+        near, body, _ = palette
+        x_from, x_to, _, floor = self.reach(side)
+        xs = [b.x0 for b in s.buckets if x_from - BW < b.x0 < x_to] + [x_to]
+        line = "M" + "L".join(f"{f(x)} {f(self.curve(side, x))}" for x in xs)
 
-        return paint("bid", "bid") + paint("ask", "ask") + self.sided(paint("zone", "bid"), paint("zone", "ask"))
+        layers: dict[tuple, list] = {}
+        for x, y, v in pile:                                        # big levels glow, small ones recede
+            tier = 0 if v >= cut[1] else 1 if v >= cut[0] else 2
+            layers.setdefault((tier, rng.random() < 0.14, rng.randrange(3)), []).append((x, y))
+        out = [f'<path d="{line}L{f(x_to)} {f(floor)}L{f(xs[0])} {f(floor)}Z" fill="{body}" fill-opacity=".07"/>']
+        for (tier, coarse, group), pts in sorted(layers.items()):
+            width, alpha = (2.3, 0.42) if coarse else (1.25, TWINKLE[1 + tier])
+            dur = 2.6 + 1.1 * group + 0.4 * tier + (tier + group) % 3 * 0.37
+            out.append(f'<path d="{dots(pts)}" stroke="{palette[tier]}" stroke-opacity="{alpha:g}" '
+                       f'stroke-width="{width}" stroke-linecap="round" style="{twinkle(alpha, dur, dur * group / 3)}"/>')
+        crest = [(x, self.curve(side, x) + 0.8 + rng.random() * 2.5) for x in (b + rng.random() * BW for b in xs[:-1])]
+        out.append(f'<path d="{dots(crest)}" stroke="{near}" stroke-width="1.5" stroke-linecap="round" '
+                   f'style="{twinkle(1.0, 3.3)}"/>')
+        out.append(f'<path d="{line}" fill="none" stroke="{body}" stroke-opacity=".14" stroke-width="6" stroke-linejoin="round"/>'
+                   f'<path d="{line}" fill="none" stroke="{body}" stroke-width="1.3" stroke-linejoin="round"/>')
+        if side in s.walls:
+            out.append(self.wall(side, s.walls[side], floor))
+        return f'<g clip-path="url(#plot)"><g class="{self.frame(side)}">{"".join(out)}</g></g>'
 
-    def walls(self) -> str:
-        rng, out = self.rng, []
-        for name, wall in self.s.walls.items():
-            near, base, _ = BID if name == "bid" else ASK
-            x, top = wall.xc, BASE - wall.h
-            core = [(x + rng.gauss(0, 1.1), BASE - wall.h * rng.random() ** 0.8) for _ in range(int(wall.h * 1.6))]
-            halo = [(x + rng.gauss(0, 4.5), BASE - wall.h * rng.random() ** 1.2) for _ in range(int(wall.h * 0.5))]
-            out.append(f'<rect x="{f(x - 9)}" y="{f(top - 30)}" width="18" height="{f(wall.h + 30)}" fill="url(#wall-{name})" '
-                       f'style="animation:pulse 3.6s ease-in-out infinite"/>')
-            out.append(f'<path d="{dots(halo)}" stroke="{base}" stroke-opacity=".35" stroke-width="2.6" stroke-linecap="round" '
-                       f'style="{twinkle(0.35, 2.9, 1)}"/>')
-            out.append(f'<path d="{dots(core)}" stroke="{near}" stroke-width="1.5" stroke-linecap="round" '
-                       f'style="{twinkle(1.0, 2.1)}"/>')
-            out.append(self.wall_label(name, wall))
-        return "".join(out)
+    def wall(self, side: str, wall: Bucket, floor: float) -> str:
+        """A wall is a cliff in the depth curve: light it, and raise a pillar to the baseline."""
+        near, _, _ = BID if side == "bid" else ASK
+        c0, c1 = self.curve(side, wall.x0), self.curve(side, wall.x0 + BW)
+        top, x = min(c0, c1), wall.xc
+        return (f'<rect x="{f(x - 9)}" y="{f(top)}" width="18" height="{f(floor - top)}" fill="url(#wall-{side})" '
+                f'style="animation:pulse 3.6s ease-in-out infinite"/>'
+                f'<path d="M{f(wall.x0)} {f(c0)}L{f(wall.x0 + BW)} {f(c1)}" stroke="{near}" stroke-opacity=".35" stroke-width="7"/>'
+                f'<path d="M{f(wall.x0)} {f(c0)}L{f(wall.x0 + BW)} {f(c1)}" stroke="{near}" stroke-width="2.2"/>')
 
-    def wall_label(self, name: str, wall: Bucket) -> str:
+    def wall_label(self, side: str, wall: Bucket) -> str:
         """Price and size, plus the wall's distance from the replayed mid, ticking each minute."""
-        near, base, _ = BID if name == "bid" else ASK
-        x, top = wall.xc, BASE - wall.h
-        title, ts, tls = f"{name.upper()} WALL", 12, 1.5
+        near, base, _ = BID if side == "bid" else ASK
+        x = wall.xc
+        top = min(self.curve(side, wall.x0), self.curve(side, wall.x0 + BW))
+        title, ts, tls = f"{side.upper()} WALL", 12, 1.5
         dists = [signed((wall.top[0] / p - 1) * 100, "+.2f") + "%" for p in self.s.prices]
-        head = title + "  " + dists[0]
         value_plain = f"{money(wall.top[0])} · {wall.volume:,.1f} BTC"
-        width = max(mono_width(head, ts, tls), mono_width(value_plain, 15))
-        outward = -1 if name == "bid" else 1
+        width = max(mono_width(title + "  " + max(dists, key=len), ts, tls), mono_width(value_plain, 15))
+        outward = -1 if side == "bid" else 1
         if (outward < 0 and x - 14 - width < PAD) or (outward > 0 and x + 14 + width > W - PAD):
             outward = -outward                                      # keep the label on the canvas
         left = x + 14 if outward > 0 else x - 14 - width
@@ -606,73 +700,34 @@ class Renderer:
         dx = left + mono_width(title + "  ", ts, tls)
         lines = [text(dx, ty - 14 + i * 18, d, ts, MUTED, weight=700, ls=tls) for i, d in enumerate(dists)]
         box = (left - 6, ty - 30, left + width + 6, ty + 9)
-        self.labels.append(box)
         return (f'<rect x="{f(box[0])}" y="{f(box[1])}" width="{f(box[2] - box[0])}" height="{f(box[3] - box[1])}" '
                 f'rx="5" fill="{BG0}" opacity=".72"/>'
                 f'<path d="M{f(x)} {f(top - 4)}V{f(ty - 4)}h{f(outward * 8)}" fill="none" stroke="{base}" stroke-opacity=".7"/>'
                 f'<circle cx="{f(x)}" cy="{f(top)}" r="2.6" fill="{near}"/>'
                 + text(left, ty - 14, title, ts, base, weight=700, ls=tls)
-                + self.ticker(lines, (dx - 2, ty - 28, mono_width(dists[0], ts, tls) + 6, 18), 18)
+                + self.ticker(lines, (dx - 2, ty - 27, mono_width(max(dists, key=len), ts, tls) + 6, 17), 18)
                 + text(left, ty + 4, f'{money(wall.top[0])} <tspan fill="{MUTED}">· {wall.volume:,.1f} BTC</tspan>', 15, INK))
-
-    def rain(self) -> str:
-        """Fresh limit orders falling onto levels that keep their side all hour."""
-        rng, out = self.rng, []
-        pool = [b for b in self.s.buckets if b.volume > 0 and b.kind != "zone" and PAD <= b.xc <= W - PAD]
-        if not pool:
-            return ""
-        for b in rng.choices(pool, [b.volume ** 0.6 for b in pool], k=RAIN):
-            land = BASE - b.h
-            drop = min(110, land - (BASE - HMAX + 8))          # never above the field: labels live there
-            if drop < 24:
-                continue
-            x = b.x0 + rng.random() * BW
-            if any(x0 - 4 <= x <= x1 + 4 and land - drop - 11 <= y1 and land >= y0 for x0, y0, x1, y1 in self.labels):
-                continue
-            dur = rng.uniform(1.8, 3.6)
-            out.append(f'<rect class="fall" x="{f(x - 0.5)}" y="{f(land - 11)}" width="1" height="11" '
-                       f'fill="url(#drop-{b.kind})" style="--d:-{f(drop)}px;animation-duration:{dur:.2f}s;'
-                       f'animation-delay:-{rng.random() * dur:.2f}s"/>')
-        return "".join(out)
 
     def mid(self) -> str:
         """The mid price: a BTC-orange beam that walks the hour across the fixed axis."""
-        s, top = self.s, BASE - HMAX - 12
-        tag_y, tag_w = top - 26, 86
-        ages = [f'−{len(s.prices) - 1 - i}m' for i in range(len(s.prices) - 1)]
-        lines = [text(CX, tag_y + 16 + i * 20, a, 13, MUTED, "middle") for i, a in enumerate(ages)]
-        lines.append(text(CX, tag_y + 16 + len(ages) * 20, "NOW", 13, BTC, "middle", 700, 1))
-        rewind = text(CX, tag_y + 16 + len(s.prices) * 20, "◂◂ 60m", 13, MUTED, "middle")
-        glow = self.replay("opacity", [".55"] * (len(s.prices) - 1) + ["1"])
-        walk = self.replay("transform", [f"{f(x - CX)} 0" for x in s.track], translate=True)
-        return (f'<g><ellipse cx="{CX}" cy="{f((top + BASE) / 2)}" rx="30" ry="{f((BASE - top) / 2 + 30)}" '
-                f'fill="url(#beam-glow)" opacity=".55">{glow}</ellipse>'
-                f'<ellipse cx="{CX}" cy="{BASE - 6}" rx="80" ry="28" fill="url(#heat)"/>'
-                f'<rect x="{CX - 0.8}" y="{top}" width="1.6" height="{BASE - top}" fill="url(#beam)"/>'
-                f'<rect x="{CX - tag_w / 2}" y="{tag_y}" width="{tag_w}" height="23" rx="11.5" fill="#0B111C" '
-                f'stroke="{BTC}" stroke-opacity=".55"/>'
-                + self.ticker(lines, (CX - tag_w / 2, tag_y, tag_w, 23), 20, rewind)
-                + f'<path d="M{CX} {BASE - 5}l5 5-5 5-5-5z" fill="{BTC}"/>'
-                + self.sparks() + walk + "</g>")
-
-    def sparks(self) -> str:
-        """Executions at the touch, spraying into both sides of the book."""
-        rng, out = self.rng, []
-        for i in range(SPARKS):
-            side = -1 if i % 2 else 1
-            near = (BID if side < 0 else ASK)[0]
-            dur = rng.uniform(1.2, 2.4)
-            out.append(f'<circle class="spark" cx="{CX}" cy="{BASE - 2}" r="{rng.choice((0.9, 1.2, 1.6))}" fill="{near}" '
-                       f'style="--sx:{f(side * rng.uniform(25, 95))}px;--sy:{f(-rng.uniform(0, 34))}px;'
-                       f'animation-duration:{dur:.2f}s;animation-delay:-{rng.random() * dur:.2f}s"/>')
-        return "".join(out)
+        top = BASE - HMAX - 12
+        arrive = self.animation("arrive", [(0, "opacity:.55"), (self.stops[-2], "opacity:.55"),
+                                           (self.stops[-1], "opacity:1"), (HOLD_END, "opacity:.8"), (100, "opacity:.55")],
+                                "opacity:.8")
+        return f'<g class="{self.walk()}">' + (
+            f'<ellipse class="{arrive}" cy="{f((top + BASE) / 2)}" rx="30" ry="{f((BASE - top) / 2 + 30)}" fill="url(#beam-glow)"/>'
+            f'<ellipse cy="{BASE - 6}" rx="80" ry="28" fill="url(#heat)" style="animation:pulse 2.2s ease-in-out infinite"/>'
+            f'<rect x="-.8" y="{top}" width="1.6" height="{BASE - top}" fill="url(#beam)"/>'
+            f'<circle cy="{top}" r="2.4" fill="{BTC}"/>'
+            f'<path d="M0 {BASE - 5}l5 5-5 5-5-5z" fill="{BTC}"/>'
+            + "</g>")
 
     # ── axis ────────────────────────────────────────────────────────────────
     def ticks(self) -> list[tuple[float, float]]:
         s = self.s
         lo, hi = s.center * math.exp(-s.R), s.center * math.exp(s.R)
-        step = next(st for st in (10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000)
-                    if (hi - lo) / st <= 10)
+        step = next((st for st in (10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000)
+                     if (hi - lo) / st <= 10), 10 ** math.ceil(math.log10((hi - lo) / 10)))
         out, p = [], math.ceil(lo / step) * step
         while p <= hi:
             x = s.x(p)
@@ -717,55 +772,52 @@ class Renderer:
         span = (hi - lo) or 1
         ox, floor = W - PAD - SPARK_W, 132
         pts = [(ox + SPARK_W * i / (n - 1), floor - SPARK_H * (v - lo) / span) for i, v in enumerate(p)]
-        up = p[-1] >= p[0]
-        color = BID[1] if up else ASK[1]
+        color = BID[1] if p[-1] >= p[0] else ASK[1]
         line = "M" + "L".join(f"{f(x)} {f(y)}" for x, y in pts)
         area = line + f"L{f(pts[-1][0])} {floor}L{f(pts[0][0])} {floor}Z"
         change = (p[-1] / p[0] - 1) * 100
-        x0, y0 = pts[0]
-        moves = self.replay("transform", [f"{f(x - x0)} {f(y - y0)}" for x, y in pts], translate=True)
-        fade = (f'<animate attributeName="opacity" dur="{LOOP}s" repeatCount="indefinite" values="1;1;0;0;1" '
-                f'keyTimes="0;{t(HOLD_END / 100)};{t(HOLD_END / 100 + 0.012)};.99;1"/>')
+        moves = [f"transform:translate({f(x)}px,{f(y)}px)" for x, y in pts]
+        cursor = self.animation("cursor", list(zip(self.stops, moves)) + [
+            (HOLD_END, moves[-1] + ";opacity:1"), (94.5, moves[-1] + ";opacity:0"),
+            (99.9, moves[0] + ";opacity:0"), (100, moves[0] + ";opacity:1")], moves[-1])
         return (f'<linearGradient id="sl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{color}" stop-opacity=".25"/>'
                 f'<stop offset="1" stop-color="{color}" stop-opacity="0"/></linearGradient>'
                 f'<path d="{area}" fill="url(#sl)"/>'
                 f'<path d="{line}" fill="none" stroke="{color}" stroke-width="1.4" stroke-linejoin="round"/>'
                 + text(ox - 10, floor - 2, f'60M <tspan fill="{color}">{signed(change, "+.2f")}%</tspan>', 11, MUTED, "end", ls=0.8)
-                + f'<g transform="translate({f(x0)} {f(y0)})"><g>'
-                  f'<circle r="7" fill="{BTC}" opacity=".25"/><circle r="2.8" fill="#FFF3E0"/>{moves}{fade}</g></g>')
+                + f'<g class="{cursor}"><circle r="7" fill="{BTC}" opacity=".25"/><circle r="2.8" fill="#FFF3E0"/></g>')
 
     def headline(self) -> str:
-        """The replayed mid: it snaps to each new print, then spins back through the hour on rewind."""
+        """The replayed mid with the minute it printed, and its change on the day."""
         s = self.s
-        change = (s.mid / s.m.open_24h - 1) * 100
-        color = BID[1] if change >= 0 else ASK[1]
-        arrow = "▲" if change >= 0 else "▼"
-        base, lh, snap = 206, 70, 0.004 / LOOP
-        n = len(s.prices)
-        kt, values, splines = [0.0], ["0 0"], []
-        for i in range(1, n):
-            kt += [self.kt[i], self.kt[i] + snap]
-            values += [f"0 {-(i - 1) * lh}", f"0 {-i * lh}"]
-            splines += ["0 0 1 1", "0 0 1 1"]
-        kt += [HOLD_END / 100, 1.0]
-        values += [f"0 {-(n - 1) * lh}", "0 0"]
-        splines += ["0 0 1 1", ".6 0 .4 1"]
-        lines = "".join(f'<text x="{CX}" y="{base + i * lh}">{money(p)}</text>' for i, p in enumerate(s.prices))
+        base, lh, n = 206, 70, len(s.prices)
+        prices = "".join(f'<text x="{CX}" y="{base + i * lh}">{money(p)}</text>' for i, p in enumerate(s.prices))
+        # Inter Display's tabular figures run ~0.62 em, separators ~0.3 em, plus 1 px tracking
+        widest = max((money(p) for p in s.prices), key=len)
+        half = (sum(0.62 if ch.isdigit() else 0.3 for ch in widest) * 58 + len(widest)) / 2
+        ages = [text(CX + half + 16, base - 22 + i * 20, f"−{n - 1 - i}m", 13, MUTED) for i in range(n - 1)]
+        ages.append(text(CX + half + 16, base - 22 + (n - 1) * 20, "NOW", 13, BTC, weight=700, ls=1))
+        days = []
+        for i, p in enumerate(s.prices):
+            change = (p / s.m.open_24h - 1) * 100
+            color, arrow = (BID[1], "▲") if change >= 0 else (ASK[1], "▼")
+            days.append(text(CX, 232 + i * 18, f'<tspan fill="{color}">{arrow} {signed(change, "+.2f")}%</tspan>  24H   '
+                                               f'<tspan fill="{DIM}">H</tspan> {money(s.m.high_24h, 0)}  '
+                                               f'<tspan fill="{DIM}">L</tspan> {money(s.m.low_24h, 0)}', 13, MUTED, "middle"))
         return "".join([
-            text(CX, 152, "BTC / USD", 12, MUTED, "middle", ls=5),
-            f'<clipPath id="quote"><rect x="{CX - 330}" y="{base - 52}" width="660" height="68"/></clipPath>'
-            f'<g clip-path="url(#quote)"><g font-family="{DISPLAY}" font-size="58" font-weight="300" fill="#F4F7FB" '
-            f'text-anchor="middle" letter-spacing="1" style="font-variant-numeric:tabular-nums">{lines}'
-            + self._smil("transform", values, kt, "spline", True, splines) + "</g></g>",
-            text(CX, 232, f'<tspan fill="{color}">{arrow} {signed(change, "+.2f")}%</tspan>  24H   '
-                          f'<tspan fill="{DIM}">H</tspan> {money(s.m.high_24h, 0)}  <tspan fill="{DIM}">L</tspan> '
-                          f'{money(s.m.low_24h, 0)}', 13, MUTED, "middle"),
+            text(CX, 148, "BTC / USD", 12, MUTED, "middle", ls=5),
+            f'<clipPath id="quote"><rect x="{CX - 330}" y="{base - 46}" width="660" height="56"/></clipPath>'
+            f'<g clip-path="url(#quote)"><g class="{self.stepper(lh)}" font-family="{DISPLAY}" font-size="58" '
+            f'font-weight="300" fill="#F4F7FB" text-anchor="middle" letter-spacing="1" '
+            f'style="font-variant-numeric:tabular-nums">{prices}</g></g>',
+            self.ticker(ages, (CX + half + 14, base - 36, 60, 18), 20),
+            self.ticker(days, (CX - 300, 219, 600, 17), 18),
         ])
 
     # ── quant strip ─────────────────────────────────────────────────────────
     def stats(self) -> str:
         s = self.s
-        band = f"±{s.R * 100:g}%"
+        band = f"±{f'{s.band * 100:.2f}'.rstrip('0').rstrip('.')}%"
         top, cw = BASE + 50, (W - 2 * PAD) / 6
         obi = [(b - a) / max(1e-9, b + a) for b, a in s.depth]
 
